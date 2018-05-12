@@ -15,8 +15,11 @@ import {
   NormalizedCacheObject,
 } from './types';
 import { writeResultToStore } from './writeToStore';
+
 import { StoreReader } from './readFromStore';
-import { defaultNormalizedCacheFactory } from './depTrackingCache';
+import { defaultNormalizedCacheFactory, DepTrackingCache } from './depTrackingCache';
+import { wrap, defaultMakeCacheKey } from "./optimism";
+
 import { record } from './recordingCache';
 const defaultConfig: ApolloReducerConfig = {
   fragmentMatcher: new HeuristicFragmentMatcher(),
@@ -40,7 +43,7 @@ export class InMemoryCache extends ApolloCache<NormalizedCacheObject> {
   protected data: NormalizedCache;
   protected config: ApolloReducerConfig;
   protected optimistic: OptimisticStoreItem[] = [];
-  private watches: Cache.WatchOptions[] = [];
+  private watches = new Set<Cache.WatchOptions>();
   private addTypename: boolean;
   private typenameDocumentCache = new WeakMap<DocumentNode, DocumentNode>();
   private storeReader: StoreReader;
@@ -72,6 +75,22 @@ export class InMemoryCache extends ApolloCache<NormalizedCacheObject> {
     this.data = defaultNormalizedCacheFactory();
 
     this.storeReader = new StoreReader();
+
+    const { maybeBroadcastWatch } = this;
+    const hasDepTrackingCache = () => this.data instanceof DepTrackingCache;
+    this.maybeBroadcastWatch = wrap((c: Cache.WatchOptions) => {
+      return maybeBroadcastWatch.call(this, c);
+    }, {
+      makeCacheKey(c: Cache.WatchOptions) {
+        if (hasDepTrackingCache()) {
+          return defaultMakeCacheKey(
+            c.query,
+            c.optimistic,
+            JSON.stringify(c.variables),
+          );
+        }
+      }
+    });
   }
 
   public restore(data: NormalizedCacheObject): this {
@@ -139,10 +158,10 @@ export class InMemoryCache extends ApolloCache<NormalizedCacheObject> {
   }
 
   public watch(watch: Cache.WatchOptions): () => void {
-    this.watches.push(watch);
+    this.watches.add(watch);
 
     return () => {
-      this.watches = this.watches.filter(c => c !== watch);
+      this.watches.delete(watch);
     };
   }
 
@@ -282,18 +301,16 @@ export class InMemoryCache extends ApolloCache<NormalizedCacheObject> {
     if (this.silenceBroadcast) return;
 
     // right now, we invalidate all queries whenever anything changes
-    this.watches.forEach((c: Cache.WatchOptions) => {
-      const newData = this.diff({
-        query: c.query,
-        variables: c.variables,
+    this.watches.forEach(this.maybeBroadcastWatch, this);
+  }
 
-        // TODO: previousResult isn't in the types - this will only work
-        // with ObservableQuery which is in a different package
-        previousResult: (c as any).previousResult && c.previousResult(),
-        optimistic: c.optimistic,
-      });
-
-      c.callback(newData);
-    });
+  // This method is wrapped in the constructor so that it will be called only
+  // if the data that would be broadcast has changed.
+  private maybeBroadcastWatch(c: Cache.WatchOptions) {
+    c.callback(this.diff({
+      query: c.query,
+      variables: c.variables,
+      optimistic: c.optimistic,
+    }));
   }
 }
